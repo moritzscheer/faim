@@ -9,62 +9,44 @@ namespace faim
 {
 namespace networking
 {
-
-int session_new(void *conn, stream_t *stream)
+namespace webt
 {
-    connection *c = reinterpret_cast<connection *>(conn);
-    if (!conn)
-    {
-        return 0;
-    }
 
-    ngwebtr_conn *webt = c->webt.create(stream->id);
+int ngwebt_conn::session_new()
+{
+    ngwebt_conn *webt = (ngwebt_conn *)calloc(1, sizeof(ngwebt_conn));
     if (!webt)
     {
         return -errno;
     }
 
-    stream->conn = webt;
-
     return 0;
 }
 
-void session_del(connection *conn, ngwebtr_conn *webt)
+void ngwebt_conn::session_del()
 {
-    if (webt->control_stream)
-    {
-        webt->control_stream->close_stream();
-        free(webt->control_stream);
-    }
-
-    webt->streams.del_all([](stream_t *stream) {
-        stream->close_stream();
-        free(stream);
-        return true;
-    });
-
-    conn->webt.del(webt->id);
 }
 
 uint64_t infer_quic_error_code(int err)
 {
     switch (err)
     {
-    case WEBTRANSPORT_PROTOCOL_VIOLATION: {
+    case WEBTRANSPORT_PROTOCOL_VIOLATION:
+    {
     }
     default:
         return nghttp3_err_infer_quic_app_error_code(err);
     }
 }
 
-int ngwebtr_conn_close_stream(connection *conn, stream_t *stream)
+int ngwebt_conn_close_stream(connection *conn, stream_t *stream)
 {
     if (!stream)
     {
         return NGHTTP3_ERR_STREAM_NOT_FOUND;
     }
 
-    ngwebtr_conn *webt = reinterpret_cast<ngwebtr_conn *>(stream->conn);
+    ngwebt_conn *webt = reinterpret_cast<ngwebt_conn *>(stream->conn);
 
     if (stream_is_control_stream(webt, stream))
     {
@@ -76,5 +58,6 @@ int ngwebtr_conn_close_stream(connection *conn, stream_t *stream)
     return 0;
 }
 
+}; // namespace webt
 }; // namespace networking
 }; // namespace faim

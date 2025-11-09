@@ -2,46 +2,100 @@
 
 #pragma once
 
-#include <condition_variable>
-#include <mutex>
-#include <queue>
-
-namespace safe
+template <typename type> class queue
 {
-
-template <typename T> class queue
-{
-    std::queue<T> queue;
-    std::mutex mtx;
-    std::condition_variable cv;
+  private:
+    type *head;
+    type *tail;
 
   public:
-    void push(T *item)
+    queue() : head(nullptr), tail(nullptr) {};
+
+    void push(type *item)
     {
+        item->next = nullptr;
+
+        if (!head)
         {
-            std::lock_guard<std::mutex> lock(mtx);
-            queue.push(item);
+            head = tail = item;
         }
-        cv.notify_one();
+        else
+        {
+            tail->next = item;
+            tail = item;
+        }
     }
 
-    T *pop()
+    type *pop()
     {
-        std::unique_lock<std::mutex> lock(mtx);
-        cv.wait(lock, [&] { return !queue.empty(); });
-        T *item = queue.front();
-        queue.pop();
+        if (!head)
+        {
+            return nullptr;
+        }
+
+        type *item = head;
+        head = head->next;
+
+        if (!head)
+        {
+            tail = nullptr;
+        }
+
+        item->next = nullptr;
         return item;
     }
 
-    bool try_pop(T &item)
+    int flush(int (*f)(type *) noexcept)
     {
-        std::lock_guard<std::mutex> lock(mtx);
-        if (queue.empty())
-            return false;
-        item = std::move(queue.front());
-        queue.pop();
-        return true;
+        type *curr = head;
+        type *prev = nullptr;
+
+        int count = 0;
+
+        while (curr)
+        {
+            type *next = curr->next;
+
+            int res = f(curr);
+
+            if (res == 0)
+            {
+                count++;
+
+                if (prev)
+                {
+                    prev->next = next; // skip curr
+                }
+                else
+                {
+                    head = next; // remove head
+                }
+
+                if (next == nullptr) // remove tail
+                {
+                    tail = prev;
+                }
+
+                curr->next = nullptr; // detach node
+            }
+            else
+            {
+                prev = curr; // curr stays in queue
+            }
+
+            curr = curr->next; // move to next node
+        }
+
+        return count;
+    }
+
+    bool empty()
+    {
+        return head == nullptr;
+    }
+
+    type *front()
+    {
+        return head;
     }
 };
-} // namespace safe

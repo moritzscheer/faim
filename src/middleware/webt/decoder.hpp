@@ -12,6 +12,8 @@ namespace faim
 {
 namespace networking
 {
+namespace webt
+{
 
 typedef enum
 {
@@ -49,16 +51,36 @@ typedef enum
 
 } setting;
 
+ssize_t read_stream(connection *conn, int64_t stream_id, const uint8_t *src, size_t srclen, int fin, uint64_t ts);
+
+void set_max_streams_bidi(connection *conn, uint64_t max_streams);
+
+int add_ack_offset(connection *conn, int64_t stream_id, uint64_t n);
+
+int reset_stream(connection *conn, int64_t stream_id);
+
+int close_stream(connection *conn, stream_t *stream, uint64_t app_error_code);
+
+int unblock_stream(connection *conn, int64_t stream_id);
+
+int shutdown_stream(connection *conn, int64_t stream_id);
+
+//
+//
+//
+ssize_t read_stream(connection *conn, int64_t stream_id, const uint8_t *src, size_t srclen, int fin, nghttp3_tstamp ts);
+
 size_t parse_stream_header(connection *conn, stream_t *stream, int flags, const uint8_t *data, size_t datalen);
 
-size_t parse_control_stream(ngwebtr_conn *conn, const uint8_t *data, const size_t datalen, size_t &offset);
+size_t parse_control_stream(ngwebt_conn *conn, const uint8_t *data, const size_t datalen, size_t &offset);
 
-void parse_settings_frame(ngwebtr_conn *conn, uint8_t *data, size_t datalen, size_t &offset);
+void parse_settings_frame(ngwebt_conn *conn, uint8_t *data, size_t datalen, size_t &offset);
 
-void parse_goaway_frame(ngwebtr_conn *conn, uint8_t *data, size_t datalen, size_t &offset);
+void parse_goaway_frame(ngwebt_conn *conn, uint8_t *data, size_t datalen, size_t &offset);
 
-size_t handle_stream_data(ngwebtr_conn *conn, stream_t *stream, uint32_t flags, const uint8_t *data, size_t datalen,
+size_t handle_stream_data(ngwebt_conn *conn, stream_t *stream, uint32_t flags, const uint8_t *data, size_t datalen,
                           size_t &offset);
 
+} // namespace webt
 } // namespace networking
 } // namespace faim

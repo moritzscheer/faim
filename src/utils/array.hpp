@@ -7,18 +7,18 @@
 #include <cstdlib>
 #include <string.h>
 
-template <typename t> class array_t
+template <typename object> class array_t
 {
-    t *base = nullptr;
+    object *base = nullptr;
 
     uint16_t size = 0;
 
     uint16_t count = 0;
 
   public:
-    array_t<t> *construct(uint16_t initial_size)
+    array_t<object> *construct(uint16_t initial_size)
     {
-        base = reinterpret_cast<t>(calloc(sizeof(t), initial_size));
+        base = (object *)calloc(initial_size, sizeof(object));
         if (!base)
         {
             return NULL;
@@ -30,13 +30,13 @@ template <typename t> class array_t
         return this;
     }
 
-    int add(t item)
+    int add(object item)
     {
         if (count >= size)
         {
             uint16_t new_size = size * 2;
 
-            t *tmp = reinterpret_cast<t *>(realloc(base, sizeof(t) * new_size));
+            object *tmp = reinterpret_cast<object *>(realloc(base, sizeof(object) * new_size));
             if (!tmp)
             {
                 return -errno;
@@ -49,7 +49,7 @@ template <typename t> class array_t
         return true;
     }
 
-    void remove(t item)
+    void remove(object item)
     {
         uint16_t idx = 0;
 

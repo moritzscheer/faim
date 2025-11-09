@@ -3,10 +3,14 @@
 #pragma once
 
 #include <cerrno>
+#include <cstring>
+#include <stdlib.h>
 
+#include <nghttp3/nghttp3.h>
 #include <ngtcp2/ngtcp2.h>
 
 #include "stream.hpp"
+#include "webt/encoder.hpp"
 
 namespace faim
 {
@@ -15,38 +19,38 @@ namespace networking
 
 #define MIN_STREAM_DATALEN
 
-int stream_buf::push_data(const uint8_t *data, size_t datalen)
+int stream_buf::push_data(const uint8_t *new_data, size_t new_datalen)
 {
-    if (!data || datalen == 0)
+    if (!new_data || new_datalen == 0)
     {
         return 0;
     }
 
-    if (!buf)
+    if (!data)
     {
-        buf = (uint8_t *)malloc(NGTCP2_MAX_UDP_PAYLOAD_SIZE * 4);
-        if (!buf)
+        data = (uint8_t *)malloc(NGTCP2_MAX_UDP_PAYLOAD_SIZE * 4);
+        if (!data)
         {
             return -errno;
         }
 
-        buflen = NGTCP2_MAX_UDP_PAYLOAD_SIZE * 4;
+        datalen = NGTCP2_MAX_UDP_PAYLOAD_SIZE * 4;
     }
-    else if (push_offset + datalen > buflen)
+    else if (push_offset + new_datalen > datalen)
     {
-        size_t new_len = buflen * 2;
+        size_t new_len = datalen * 2;
 
-        uint8_t *buf = (uint8_t *)realloc(buf, new_len);
-        if (!buf)
+        uint8_t *tmp = (uint8_t *)realloc(data, new_len);
+        if (!tmp)
         {
             return -errno;
         }
 
-        buf = buf;
-        buflen = new_len;
+        data = tmp;
+        datalen = new_len;
     }
 
-    memcpy(buf + push_offset, data, datalen);
+    memcpy((uint8_t *)data + push_offset, new_data, new_datalen);
     push_offset += datalen;
 
     return 0;
@@ -54,7 +58,7 @@ int stream_buf::push_data(const uint8_t *data, size_t datalen)
 
 int stream_buf::ack_data(size_t datalen)
 {
-    if (!buf || datalen == 0)
+    if (!data || datalen == 0)
     {
         return 0;
     }
@@ -73,22 +77,43 @@ int stream_buf::ack_data(size_t datalen)
 
 void stream_buf::reset_data()
 {
-    if (buf)
+    if (data)
     {
-        free(buf);
+        free(data);
     }
     *this = {};
+}
+
+iovec *stream_t::get_tx_data()
+{
+    switch (id)
+    {
+    case CLIENT_UNI:
+    {
+        return 0;
+    }
+    case SERVER_UNI:
+    {
+        uni_tx_stream_t *stream = static_cast<uni_tx_stream_t *>(this);
+        return reinterpret_cast<iovec *>(&stream->tx);
+    }
+    default:
+    {
+        bidi_stream_t *stream = static_cast<bidi_stream_t *>(this);
+        return reinterpret_cast<iovec *>(&stream->tx);
+    }
+    }
 }
 
 int stream_t::push_tx_data(const uint8_t *data, size_t datalen)
 {
     switch (id)
     {
-    case STREAM_CLIENT_UNI:
+    case CLIENT_UNI:
     {
         return 0;
     }
-    case STREAM_SERVER_UNI:
+    case SERVER_UNI:
     {
         return static_cast<uni_tx_stream_t *>(this)->tx.push_data(data, datalen);
     }
@@ -103,11 +128,11 @@ int stream_t::push_rx_data(const uint8_t *data, size_t datalen)
 {
     switch (id)
     {
-    case STREAM_CLIENT_UNI:
+    case CLIENT_UNI:
     {
         return static_cast<uni_rx_stream_t *>(this)->rx.push_data(data, datalen);
     }
-    case STREAM_SERVER_UNI:
+    case SERVER_UNI:
     {
         return 0;
     }
@@ -118,36 +143,15 @@ int stream_t::push_rx_data(const uint8_t *data, size_t datalen)
     }
 }
 
-stream_t *stream_t::create(uint64_t stream_id)
-{
-    stream_t *stream;
-
-    switch (stream_id)
-    {
-    case STREAM_CLIENT_UNI:
-    {
-        stream = (stream_t *)calloc(sizeof(uni_rx_stream_t), 1);
-    }
-    case STREAM_SERVER_UNI:
-    {
-        stream = (stream_t *)calloc(sizeof(uni_tx_stream_t), 1);
-    }
-    default:
-        stream = (stream_t *)calloc(sizeof(bidi_stream_t), 1);
-    }
-
-    return stream;
-}
-
 int stream_t::ack_data(size_t datalen)
 {
     switch (id)
     {
-    case STREAM_CLIENT_UNI:
+    case CLIENT_UNI:
     {
         return 0;
     }
-    case STREAM_SERVER_UNI:
+    case SERVER_UNI:
     {
         return static_cast<uni_tx_stream_t *>(this)->tx.ack_data(datalen);
     }
@@ -158,65 +162,56 @@ int stream_t::ack_data(size_t datalen)
     }
 }
 
-void stream_t::reset_stream()
-{
-    switch (id)
-    {
-    case STREAM_CLIENT_UNI:
-    {
-        static_cast<uni_rx_stream_t *>(this)->rx.reset_data();
-    }
-    case STREAM_SERVER_UNI:
-    {
-        static_cast<uni_tx_stream_t *>(this)->tx.reset_data();
-    }
-    default:
-    {
-        bidi_stream_t *stream = static_cast<bidi_stream_t *>(this);
-        stream->rx.reset_data();
-        stream->tx.reset_data();
-    }
-    }
-}
-
 void stream_t::close_stream()
 {
     switch (id)
     {
-    case STREAM_CLIENT_UNI:
+    case CLIENT_UNI:
     {
         uni_rx_stream_t *stream = static_cast<uni_rx_stream_t *>(this);
-        if (stream->rx.buf)
+        if (stream->rx.data)
         {
-            free(stream->rx.buf);
+            free(stream->rx.data);
         }
         break;
     }
-    case STREAM_SERVER_UNI:
+    case SERVER_UNI:
     {
         uni_tx_stream_t *stream = static_cast<uni_tx_stream_t *>(this);
-        if (stream->tx.buf)
+        if (stream->tx.data)
         {
-            free(stream->tx.buf);
+            free(stream->tx.data);
         }
         break;
     }
     default:
     {
         bidi_stream_t *stream = static_cast<bidi_stream_t *>(this);
-        if (stream->rx.buf)
+        if (stream->rx.data)
         {
-            free(stream->rx.buf);
+            free(stream->rx.data);
         }
-        if (stream->tx.buf)
+        if (stream->tx.data)
         {
-            free(stream->tx.buf);
+            free(stream->tx.data);
         }
     }
     }
 
     free(this);
     return;
+}
+
+void stream_storage_t::close_stream(stream_t *stream)
+{
+}
+
+void stream_storage_t::close()
+{
+    client_uni.destruct();
+    server_uni.destruct();
+    client_bidi.destruct();
+    server_bidi.destruct();
 }
 
 } // namespace networking

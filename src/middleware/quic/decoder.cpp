@@ -3,6 +3,7 @@
 #include <bits/types/struct_iovec.h>
 #include <cstdint>
 #include <ctime>
+#include <nghttp3/nghttp3.h>
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -13,6 +14,7 @@
 #include <openssl/rand.h>
 
 #include "../../utils/types.hpp"
+#include "../../utils/uvarint.hpp"
 #include "../connection.hpp"
 #include "decoder.hpp"
 #include "encoder.hpp"
@@ -25,16 +27,14 @@ namespace networking
 namespace quic
 {
 
-int validate_first_header(msghdr *&write, connection *&conn, uint8_t *pkt, size_t &pktlen, ngtcp2_path *path,
-                          uint64_t &timestamp, ngtcp2_pkt_info &info)
+int validate_first_header(connection *&conn, uint8_t *pkt, size_t &pktlen, ngtcp2_path *path, uint64_t &timestamp,
+                          ngtcp2_pkt_info &info)
 {
-
     ngtcp2_cid dcid;
 
     if (pkt[0] & FORM_BIT_MASK)
 
     {
-
         size_t len = LONG_HEADER_MIN_LENGTH;
 
         if (pktlen < len || !(pkt[0] & FIXED_BIT_MASK))
@@ -65,7 +65,7 @@ int validate_first_header(msghdr *&write, connection *&conn, uint8_t *pkt, size_
         uint64_t version = get_version(pkt);
         if (version == 0)
         {
-            return write_version_negotiation_packet(write, &path->remote, dcid, scid);
+            return write_version_negotiation_packet(&path->remote, dcid, scid);
         }
 
         ngtcp2_cid odcid;
@@ -76,14 +76,13 @@ int validate_first_header(msghdr *&write, connection *&conn, uint8_t *pkt, size_
         {
         case PKT_TYPE_INITIAL:
         {
-
             token = uvarint_t(&pkt[len]);
             if (token.len == 0)
             {
-                return write_retry_packet(write, pktlen, &path->remote, timestamp, version, &odcid, &dcid, &scid);
+                return write_retry_packet(pktlen, &path->remote, timestamp, version, &odcid, &dcid, &scid);
             }
 
-            int res = verify_token(write, token, pktlen, &path->remote, timestamp, version, &odcid, &dcid, &scid);
+            int res = verify_token(token, pktlen, &path->remote, timestamp, version, &odcid, &dcid, &scid);
             if (res != 0)
             {
                 return res;
@@ -120,10 +119,10 @@ int validate_first_header(msghdr *&write, connection *&conn, uint8_t *pkt, size_
             return 0;
         }
 
-        conn = find_connection(dcid);
+        conn = find_connection(&dcid);
         if (!conn)
         {
-            conn = create_connection(dcid);
+            conn = create_connection(&dcid);
             if (!conn)
             {
                 return -errno;
@@ -158,26 +157,24 @@ int validate_first_header(msghdr *&write, connection *&conn, uint8_t *pkt, size_
             return 0;
         }
 
-        conn = find_connection(dcid);
+        conn = find_connection(&dcid);
         if (!conn)
         {
-            return write_stateless_reset_packet(write, &dcid);
+            return write_stateless_reset_packet(&dcid);
         }
     }
-
-    conn->info = info;
 
     return 0;
 }
 
-int verify_token(msghdr *dest, uvarint_t &token, size_t &pktlen, ngtcp2_addr *remote, uint64_t &timestamp,
-                 uint32_t &version, ngtcp2_cid *odcid, ngtcp2_cid *dcid, ngtcp2_cid *scid)
+static int verify_token(uvarint_t token, size_t &pktlen, ngtcp2_addr *remote, uint64_t timestamp, uint32_t version,
+                        ngtcp2_cid *odcid, ngtcp2_cid *dcid, ngtcp2_cid *scid)
 {
 
     if (token != NGTCP2_CRYPTO_TOKEN_MAGIC_RETRY && dcid->datalen < NGTCP2_MIN_INITIAL_DCIDLEN)
     {
 
-        return write_connection_close_packet(dest, dcid, scid, version, {NGTCP2_ERR_PROTO, "Invalid DCID length"});
+        return write_connection_close_packet(dcid, scid, version, {NGTCP2_ERR_PROTO, "Invalid DCID length"});
     }
 
     switch (token)
@@ -192,7 +189,7 @@ int verify_token(msghdr *dest, uvarint_t &token, size_t &pktlen, ngtcp2_addr *re
             return 0;
         }
 
-        return write_connection_close_packet(dest, dcid, scid, version, {NGTCP2_ERR_PROTO, "Invalid DCID length"});
+        return write_connection_close_packet(dcid, scid, version, {NGTCP2_ERR_PROTO, "Invalid DCID length"});
     }
     case NGTCP2_CRYPTO_TOKEN_MAGIC_REGULAR:
     {
@@ -206,21 +203,21 @@ int verify_token(msghdr *dest, uvarint_t &token, size_t &pktlen, ngtcp2_addr *re
             return 0;
         }
 
-        return write_retry_packet(dest, pktlen, remote, timestamp, version, odcid, dcid, scid);
+        return write_retry_packet(pktlen, remote, timestamp, version, odcid, dcid, scid);
     }
     default:
 
-        return write_retry_packet(dest, pktlen, remote, timestamp, version, odcid, dcid, scid);
+        return write_retry_packet(pktlen, remote, timestamp, version, odcid, dcid, scid);
     }
 }
 
-uint32_t get_version(const uint8_t *pkt)
+static uint32_t get_version(const uint8_t *pkt)
 {
     uint32_t version = ((uint32_t)pkt[1] << 24) | ((uint32_t)pkt[2] << 16) | ((uint32_t)pkt[3] << 8) | (uint32_t)pkt[4];
     return ntohl(version);
 }
 
-bool valid_scid(ngtcp2_conn *conn, ngtcp2_cid *scid)
+static bool valid_scid(ngtcp2_conn *conn, ngtcp2_cid *scid)
 {
     size_t num_scids = ngtcp2_conn_get_scid(conn, NULL);
     if (num_scids == 0)
@@ -239,6 +236,137 @@ bool valid_scid(ngtcp2_conn *conn, ngtcp2_cid *scid)
         }
     }
     return false;
+}
+
+int parse_stream_data_header(stream_t *&dest, connection *conn, int64_t stream_id, const uint8_t *data, size_t datalen,
+                             void *stream_user_data)
+{
+    if (stream_user_data)
+    {
+        dest = reinterpret_cast<stream_t *>(stream_user_data);
+        return 0;
+    }
+
+    if (stream_id > UINT32_MAX)
+    {
+        return -1;
+    }
+
+    if (datalen < 2)
+    {
+        return 0;
+    }
+
+    uvarint_t stream_type = uvarint_t(data);
+    if (!stream_type)
+    {
+        return 0;
+    }
+
+    if (datalen < stream_type.len)
+    {
+        return 0;
+    }
+
+    uint16_t type = 0;
+
+    switch (stream_type)
+    {
+    case STREAM_TYPE_UNI_WEBTRANSPORT_STREAM:
+    case STREAM_TYPE_BIDI_WEBTRANSPORT_STREAM:
+    {
+        type |= WEBTRANSPORT;
+    }
+    case STREAM_TYPE_CONTROL_STREAM:
+    {
+        type |= CONTROL;
+    }
+    }
+
+    switch (stream_id)
+    {
+    case CLIENT_UNI:
+    {
+        type |= CLIENT_UNI;
+
+        int res = create_stream(dest, conn, stream_id, type, sizeof(stream_t), sizeof(uni_rx_stream_t));
+        if (res != 0)
+        {
+            return res;
+        }
+
+        return conn->streams.client_uni.push(dest);
+    }
+    case SERVER_UNI:
+    {
+        type |= SERVER_UNI;
+
+        int res = create_stream(dest, conn, stream_id, type, sizeof(stream_t), sizeof(uni_tx_stream_t));
+        if (res != 0)
+        {
+            return res;
+        }
+
+        return conn->streams.server_uni.push(dest);
+    }
+    case CLIENT_BIDI:
+    {
+        type |= CLIENT_BIDI;
+
+        int res = create_stream(dest, conn, stream_id, type, sizeof(uni_tx_stream_t), sizeof(bidi_stream_t));
+        if (res != 0)
+        {
+            return res;
+        }
+
+        return conn->streams.client_bidi.push(dest);
+    }
+    case SERVER_BIDI:
+    {
+        type |= SERVER_BIDI;
+
+        int res = create_stream(dest, conn, stream_id, type, sizeof(bidi_stream_t), sizeof(bidi_stream_t));
+        if (res != 0)
+        {
+            return res;
+        }
+
+        return conn->streams.server_bidi.push(dest);
+    }
+    default:
+    {
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    }
+}
+
+int create_stream(stream_t *&dest, connection *conn, int64_t &stream_id, uint16_t &type, size_t http, size_t webt)
+{
+    if (type & HTTP)
+    {
+        dest = (stream_t *)calloc(1, http);
+
+        if (!dest)
+        {
+            return -errno;
+        }
+
+        nghttp3_conn_set_stream_user_data(conn->http, stream_id, dest);
+    }
+    else
+    {
+        dest = (stream_t *)calloc(1, webt);
+
+        if (!dest)
+        {
+            return -errno;
+        }
+    }
+
+    dest->type = type;
+    dest->id = static_cast<uint32_t>(stream_id);
+
+    return ngtcp2_conn_set_stream_user_data(conn->quic, stream_id, dest);
 }
 
 } // namespace quic

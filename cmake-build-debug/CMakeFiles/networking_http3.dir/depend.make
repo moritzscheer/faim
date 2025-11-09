@@ -1,2 +1,0 @@
-# Empty dependencies file for networking_http3.
-# This may be replaced when dependencies are built.

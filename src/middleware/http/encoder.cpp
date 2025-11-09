@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <nghttp3/nghttp3.h>
+#include <ngtcp2/ngtcp2.h>
 #include <stdexcept>
 #include <vector>
 
@@ -17,35 +18,47 @@ namespace http
 {
 
 #define NO_CP_NAME NGHTTP3_NV_FLAG_NO_COPY_NAME
+
 #define NO_CP_NAME_VALUE NGHTTP3_NV_FLAG_NO_COPY_NAME | NGHTTP3_NV_FLAG_NO_COPY_VALUE
 
-ngtcp2_ssize write_pkt(ngtcp2_conn *quic, ngtcp2_path *path, ngtcp2_pkt_info *pi, uint8_t *dest, size_t destlen,
-                       ngtcp2_tstamp ts, void *user_data)
+ssize_t read_data(nghttp3_conn *conn, int64_t stream_id, nghttp3_vec *vec, size_t veccnt, uint32_t *pflags,
+                  void *conn_user_data, void *stream_user_data)
 {
-    connection *conn = reinterpret_cast<connection *>(user_data);
+    stream_t *stream = reinterpret_cast<stream_t *>(stream_user_data);
 
-    std::array<nghttp3_vec, 16> vec;
+    iovec *tx_buf = stream->get_tx_data();
 
-    for (;;)
+    if (!tx_buf)
+    {
+        return NGHTTP3_ERR_CALLBACK_FAILURE;
+    }
+
+    vec->base = (uint8_t *)tx_buf->iov_base;
+    vec->len = tx_buf->iov_len;
+
+    *pflags |= NGHTTP3_DATA_FLAG_EOF;
+
+    return 1;
+}
+
+ssize_t write_stream(connection *conn, ngtcp2_path *path, ngtcp2_pkt_info *pi, uint8_t *dest, size_t destlen,
+                     ngtcp2_tstamp ts)
+{
+    nghttp3_vec vec;
+
+    while (true)
     {
         int64_t stream_id = -1;
         int fin = 0;
-        nghttp3_ssize sveccnt = 0;
 
-        if (conn->http && ngtcp2_conn_get_max_data_left(quic))
+        ssize_t sveccnt = nghttp3_conn_writev_stream(conn->http, &stream_id, &fin, &vec, 1);
+
+        if (sveccnt < 0)
         {
-            sveccnt = nghttp3_conn_writev_stream(conn->http, &stream_id, &fin, vec.data(), vec.size());
-            if (sveccnt < 0)
-            {
-                ngtcp2_ccerr_set_application_error(
-                    conn->last_error, nghttp3_err_infer_quic_app_error_code(static_cast<int>(sveccnt)), nullptr, 0);
-                return NGTCP2_ERR_CALLBACK_FAILURE;
-            }
+            ngtcp2_ccerr_set_application_error(
+                &conn->error, nghttp3_err_infer_quic_app_error_code(static_cast<int>(sveccnt)), nullptr, 0);
+            return NGTCP2_ERR_CALLBACK_FAILURE;
         }
-
-        ngtcp2_ssize ndatalen;
-        auto v = vec.data();
-        auto vcnt = static_cast<size_t>(sveccnt);
 
         uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_MORE | NGTCP2_WRITE_STREAM_FLAG_PADDING;
         if (fin)
@@ -53,40 +66,49 @@ ngtcp2_ssize write_pkt(ngtcp2_conn *quic, ngtcp2_path *path, ngtcp2_pkt_info *pi
             flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
         }
 
-        ssize_t nwrite = ngtcp2_conn_writev_stream(quic, path, pi, dest, destlen, &ndatalen, flags, stream_id,
-                                                   reinterpret_cast<const ngtcp2_vec *>(v), vcnt, ts);
+        ssize_t ndatalen;
+        size_t vcnt = static_cast<size_t>(sveccnt);
+
+        ssize_t nwrite = ngtcp2_conn_writev_stream(conn->quic, path, pi, dest, destlen, &ndatalen, flags, stream_id,
+                                                   reinterpret_cast<const ngtcp2_vec *>(&vec), vcnt, ts);
+
         if (nwrite < 0)
         {
             switch (nwrite)
             {
             case NGTCP2_ERR_STREAM_DATA_BLOCKED:
+            {
                 nghttp3_conn_block_stream(conn->http, stream_id);
                 continue;
+            }
             case NGTCP2_ERR_STREAM_SHUT_WR:
+            {
                 nghttp3_conn_shutdown_stream_write(conn->http, stream_id);
                 continue;
+            }
             case NGTCP2_ERR_WRITE_MORE:
-                int res = nghttp3_conn_add_write_offset(conn->http, stream_id, (size_t)(ndatalen));
+            {
+                int res = nghttp3_conn_add_write_offset(conn->http, stream_id, ndatalen);
                 if (res != 0)
                 {
-                    ngtcp2_ccerr_set_application_error(conn->last_error, nghttp3_err_infer_quic_app_error_code(res),
+                    ngtcp2_ccerr_set_application_error(&conn->error, nghttp3_err_infer_quic_app_error_code(res),
                                                        nullptr, 0);
                     return NGTCP2_ERR_CALLBACK_FAILURE;
                 }
                 continue;
             }
+            }
 
-            ngtcp2_ccerr_set_liberr(conn->last_error, static_cast<int>(nwrite), nullptr, 0);
+            ngtcp2_ccerr_set_liberr(&conn->error, static_cast<int>(nwrite), nullptr, 0);
             return NGTCP2_ERR_CALLBACK_FAILURE;
         }
 
         if (ndatalen >= 0)
         {
-            if (auto rv = nghttp3_conn_add_write_offset(conn->http, stream_id, (size_t)(ndatalen)); rv != 0)
+            int res = nghttp3_conn_add_write_offset(conn->http, stream_id, (size_t)(ndatalen));
+            if (res != 0)
             {
-                ngtcp2_ccerr_set_application_error(conn->last_error, nghttp3_err_infer_quic_app_error_code(rv), nullptr,
-                                                   0);
-                return NGTCP2_ERR_CALLBACK_FAILURE;
+                return conn_set_application_error(&conn->error, res);
             }
         }
 
@@ -103,18 +125,6 @@ inline nghttp3_nv make_nv(const std::string_view &name, const std::string_view &
         value.size(),
         flags,
     };
-}
-
-nghttp3_ssize read_data(nghttp3_conn *conn, int64_t stream_id, nghttp3_vec *vec, size_t veccnt, uint32_t *pflags,
-                        void *user_data, void *stream_user_data)
-{
-    stream_t *stream = reinterpret_cast<stream_t *>(stream_user_data);
-
-    vec[0].base = stream->data;
-    vec[0].len = stream->datalen;
-    *pflags |= NGHTTP3_DATA_FLAG_EOF;
-
-    return 1;
 }
 
 int send_status_response(nghttp3_conn *conn, stream_t *stream, uint32_t status_code)

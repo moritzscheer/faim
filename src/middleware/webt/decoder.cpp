@@ -4,6 +4,7 @@
 #include <nghttp3/nghttp3.h>
 #include <ngtcp2/ngtcp2.h>
 
+#include "../../utils/uvarint.hpp"
 #include "decoder.hpp"
 #include "session.hpp"
 
@@ -11,6 +12,55 @@ namespace faim
 {
 namespace networking
 {
+namespace webt
+{
+
+ssize_t read_stream(connection *conn, int64_t stream_id, const uint8_t *src, size_t srclen, int fin, uint64_t ts)
+{
+    ssize_t nconsumed;
+
+    if (nconsumed < 0)
+    {
+        ngtcp2_ccerr_set_application_error(&conn->error, webt::infer_quic_error_code(static_cast<int>(nconsumed)),
+                                           nullptr, 0);
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+
+    if (nconsumed > 0)
+    {
+    }
+
+    return 0;
+}
+
+void set_max_streams_bidi(connection *conn, uint64_t max_streams)
+{
+}
+
+int add_ack_offset(connection *conn, int64_t stream_id, uint64_t n)
+{
+    return 0;
+}
+
+int reset_stream(connection *conn, int64_t stream_id)
+{
+    return 0;
+}
+
+int close_stream(connection *conn, stream_t *stream, uint64_t app_error_code)
+{
+    return 0;
+}
+
+int unblock_stream(connection *conn, int64_t stream_id)
+{
+    return 0;
+}
+
+int shutdown_stream(connection *conn, int64_t stream_id)
+{
+    return 0;
+}
 
 uint8_t get_session_type(uint64_t session_type)
 {
@@ -22,10 +72,6 @@ uint8_t get_session_type(uint64_t session_type)
     default:
         return HTTP;
     }
-}
-
-ngwebtr_conn *check_session_state()
-{
 }
 
 size_t parse_stream_header(connection *conn, stream_t *stream, int flags, const uint8_t *data, size_t datalen)
@@ -75,7 +121,7 @@ size_t parse_stream_header(connection *conn, stream_t *stream, int flags, const 
         return -1;
     }
 
-    ngwebtr_conn *webt = find(conn->webt, session_id);
+    ngwebt_conn *webt = find(conn->webt, session_id);
     if (!webt)
     {
         return -1;
@@ -110,7 +156,7 @@ size_t parse_stream_header(connection *conn, stream_t *stream, int flags, const 
     return offset;
 }
 
-size_t parse_control_stream(ngwebtr_conn *conn, const uint8_t *data, size_t datalen, size_t &offset)
+size_t parse_control_stream(ngwebt_conn *conn, const uint8_t *data, size_t datalen, size_t &offset)
 {
     uvarint_t frame_type;
     uvarint_t frame_len;
@@ -133,11 +179,13 @@ size_t parse_control_stream(ngwebtr_conn *conn, const uint8_t *data, size_t data
 
         switch (frame_type)
         {
-        case FRAME_SETTINGS: {
+        case FRAME_SETTINGS:
+        {
             parse_settings_frame(conn, data, datalen, offset);
             break;
         }
-        case FRAME_GOAWAY: {
+        case FRAME_GOAWAY:
+        {
             uvarint_t session_id = uvarint_t(data + offset);
             if (!session_id)
             {
@@ -166,7 +214,7 @@ size_t parse_control_stream(ngwebtr_conn *conn, const uint8_t *data, size_t data
     return offset;
 }
 
-void parse_settings_frame(ngwebtr_conn *conn, uint8_t *data, size_t datalen, size_t &offset)
+void parse_settings_frame(ngwebt_conn *conn, uint8_t *data, size_t datalen, size_t &offset)
 {
     while (offset < datalen)
     {
@@ -192,7 +240,7 @@ void parse_settings_frame(ngwebtr_conn *conn, uint8_t *data, size_t datalen, siz
     }
 }
 
-void parse_goaway_frame(ngwebtr_conn *conn, uint8_t *data, size_t datalen, size_t &nconsumed)
+void parse_goaway_frame(ngwebt_conn *conn, uint8_t *data, size_t datalen, size_t &nconsumed)
 {
     uvarint_t session_id = uvarint_t(data + nconsumed);
     nconsumed += session_id.len;
@@ -203,7 +251,7 @@ void parse_goaway_frame(ngwebtr_conn *conn, uint8_t *data, size_t datalen, size_
     }
 }
 
-size_t handle_stream_data(ngwebtr_conn *conn, stream_t *stream, uint32_t flags, const uint8_t *data, size_t datalen,
+size_t handle_stream_data(ngwebt_conn *conn, stream_t *stream, uint32_t flags, const uint8_t *data, size_t datalen,
                           size_t &offset)
 {
     size_t payload_len = datalen - offset;
@@ -212,7 +260,7 @@ size_t handle_stream_data(ngwebtr_conn *conn, stream_t *stream, uint32_t flags, 
         return 0;
     }
 
-    stream->push_data(data, datalen, RECV);
+    stream->push_tx_data(data, datalen);
 
     if (flags & NGTCP2_STREAM_DATA_FLAG_FIN)
     {
@@ -221,5 +269,6 @@ size_t handle_stream_data(ngwebtr_conn *conn, stream_t *stream, uint32_t flags, 
     return offset;
 }
 
+}; // namespace webt
 }; // namespace networking
 }; // namespace faim

@@ -2,6 +2,27 @@
 
 #pragma once
 
+#include <sys/socket.h>
+
+#include <ngtcp2/ngtcp2.h>
+#include <ngtcp2/ngtcp2_crypto.h>
+#include <ngtcp2/ngtcp2_crypto_boringssl.h>
+#include <openssl/base.h>
+#include <openssl/rand.h>
+#include <openssl/ssl.h>
+
+#include "../../utils/types.hpp"
+#include "../../utils/uvarint.hpp"
+
+namespace faim
+{
+namespace networking
+{
+namespace quic
+{
+
+/* -------------------------------------------- MACRO DECLARATIONS -------------------------------------------------- */
+
 // Protocol versions and ALPN
 #define NGTCP2_PROTO_VER_D15 0xff00000fu
 #define NGTCP2_ALPN_D15 "\x5hq-15"
@@ -39,48 +60,74 @@
 // Versions supported
 #define NUM_SUPPORTED_VERSIONS 3u
 
-#include <sys/socket.h>
+/* ------------------------------------------ VARIABLES DECLARATIONS ------------------------------------------------ */
 
-#include <ngtcp2/ngtcp2.h>
-#include <ngtcp2/ngtcp2_crypto.h>
-#include <ngtcp2/ngtcp2_crypto_boringssl.h>
-#include <openssl/base.h>
-#include <openssl/rand.h>
-#include <openssl/ssl.h>
+//
+//
+//
+static ngtcp2_ccerr app_error;
 
-#include "../../utils/types.hpp"
-
-namespace faim
-{
-namespace networking
-{
-namespace quic
-{
-
+//
+//
+//
 static inline std::array<uint32_t, 2> supported_versions;
 
+//
+//
+//
 static inline uint8_t secret[SECRET_LEN];
 
+//
+//
+//
 static inline ngtcp2_settings *default_settings;
 
+//
+//
+//
 static inline ngtcp2_transport_params *default_params;
 
+//
+//
+//
 static inline SSL_CTX *ssl_ctx;
 
-int context_init();
+//
+//
+//
+extern ngtcp2_callbacks callbacks;
 
-void context_free();
+/* ------------------------------------------- FUNCTION DECLARATIONS ------------------------------------------------ */
 
+//
+//
+//
+int setup();
+
+//
+//
+//
+void cleanup();
+
+//
+//
+//
 int create_session(connection *conn, uint64_t &version, ngtcp2_path *path, ngtcp2_cid *odcid, ngtcp2_cid *dcid,
                    ngtcp2_cid *scid, uvarint_t &token, ngtcp2_token_type &token_type, uint64_t &timestamp);
 
+//
+//
+//
 void delete_session(ngtcp2_conn *conn);
 
+void update_timer(connection *conn);
+
+//
+//
+//
 int update_timer(connection *conn, uint64_t &ts, uint8_t &action);
 
-int handle_expiry(msghdr *&msg, connection *conn, uint64_t ts);
-
-extern ngtcp2_callbacks callbacks;
+/* ------------------------------------------------------------------------------------------------------------------ */
 
 }; // namespace quic
 }; // namespace networking

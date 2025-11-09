@@ -6,24 +6,30 @@
 #include <ngtcp2/ngtcp2.h>
 #include <sys/socket.h>
 
+#include "../utils/array.hpp"
+
 namespace faim
 {
 namespace networking
 {
 
-#define STREAM_CLIENT_BIDI 0x00
-#define STREAM_SERVER_BIDI 0x01
-#define STREAM_CLIENT_UNI 0x02
-#define STREAM_SERVER_UNI 0x03
+#define CLIENT_BIDI 0x0
+#define SERVER_BIDI 0x1
 
-#define WEBTRANSPORT 1
-#define HTTP 2
+#define CLIENT_UNI 0x2
+#define SERVER_UNI 0x3
+
+#define DATA 0x4
+#define CONTROL 0x8
+
+#define HTTP 0x10
+#define WEBTRANSPORT 0x20
 
 struct stream_buf
 {
-    uint8_t *buf;
+    uint8_t *data;
 
-    size_t buflen;
+    size_t datalen;
 
     size_t ack_offset;
 
@@ -36,26 +42,17 @@ struct stream_buf
     void reset_data();
 };
 
-enum flag
-{
-    RECV,
-    SEND
-};
-
 struct stream_t
 {
-    int64_t id;
+    uint32_t id;
 
-    uint8_t type;
+    uint16_t type;
 
-    bool control;
+    uint16_t index;
 
-    void *conn;
+    stream_t *next;
 
-    static stream_t *create(uint64_t stream_id);
-
-    ssize_t process(ngtcp2_conn *conn, ngtcp2_path *path, ngtcp2_pkt_info *pi, uint8_t *dest, size_t destlen,
-                    ngtcp2_tstamp ts, void *user_data);
+    iovec *get_tx_data();
 
     int push_tx_data(const uint8_t *data, size_t datalen);
 
@@ -63,9 +60,19 @@ struct stream_t
 
     int ack_data(size_t datalen);
 
-    void reset_stream();
-
     void close_stream();
+};
+
+struct stream_storage_t
+{
+    array_t<stream_t> client_uni;
+    array_t<stream_t> server_uni;
+    array_t<stream_t> client_bidi;
+    array_t<stream_t> server_bidi;
+
+    void close_stream(stream_t *stream);
+
+    void close();
 };
 
 struct uni_rx_stream_t : stream_t

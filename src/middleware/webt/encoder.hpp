@@ -2,16 +2,18 @@
 
 #pragma once
 
-#include <cstddef>
-
-#include "../stream.hpp"
+#include "../connection.hpp"
 
 namespace faim
 {
 namespace networking
 {
+namespace webt
+{
 
-ssize_t ngwebtr_conn_writev_stream(stream_t *stream, int *pfin, iovec *vec, size_t veccnt);
+ssize_t write_stream(connection *conn, ngtcp2_path *path, ngtcp2_pkt_info *pi, uint8_t *dest, size_t destlen,
+                     ngtcp2_tstamp ts);
 
-} // namespace networking
-} // namespace faim
+}; // namespace webt
+}; // namespace networking
+}; // namespace faim

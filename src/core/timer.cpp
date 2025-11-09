@@ -1,23 +1,24 @@
 // Copyright (C) 2025, Moritz Scheer
 
 #include <cstdint>
+#include <liburing/io_uring.h>
 #include <malloc.h>
 #include <ngtcp2/ngtcp2.h>
 
 #include <cstdint>
-#include <functional>
 #include <sys/socket.h>
 
-#include "../middleware/quic/session.hpp"
-#include "server.hpp"
 #include "timer.hpp"
+#include "worker.hpp"
 
 namespace faim
 {
 namespace networking
 {
+namespace timer
+{
 
-int timerwheel::setup(int &error) noexcept
+int setup(io_uring *ring_r) noexcept
 {
     base = (bucket_t *)malloc(BASE_MEMORY_SIZE);
     if (!base)
@@ -51,34 +52,53 @@ int timerwheel::setup(int &error) noexcept
 
     current_tick = 0;
 
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring_r);
+    if (!sqe)
+    {
+        return -1;
+    }
+
+    int flags = IORING_TIMEOUT_MULTISHOT;
+
+    io_uring_prep_timeout(sqe, &timespec, 0, flags);
+
+    sqe->flags |= IOSQE_ASYNC;
+
+    io_uring_sqe_set_data(sqe, (void *)TIMER);
+
     return 0;
 }
 
-void timerwheel::cleanup() noexcept
+void cleanup() noexcept
 {
     int i = 0;
 
     bucket_t *bucket;
 
-    timer_t *p;
+    timer_t *current;
     timer_t *tmp;
 
     while (i < BASE_MEMORY_SIZE)
     {
         bucket = &base[i];
-        p = bucket->head;
+        current = bucket->head;
 
-        while (p)
+        while (current)
         {
-            tmp = p->next;
-            msghdr *msg;
-            quic::handle_expiry(msg, (connection *)p->conn, p->expiry);
-            if (msg)
+            tmp = current->next;
+
+            if (current->cancelled)
             {
-                write_pkt(msg);
+                free(current);
             }
-            free(p);
-            p = tmp;
+
+            int res = worker::enqueue_write((connection *)current->conn, current->expiry);
+            if (res != 0)
+            {
+                free(current);
+            }
+
+            current = tmp;
         }
 
         i++;
@@ -90,9 +110,9 @@ void timerwheel::cleanup() noexcept
     }
 }
 
-timer_t *timerwheel::add_timer(uint64_t timeout, void *conn) noexcept
+timer_t *add(uint64_t timeout, void *conn) noexcept
 {
-    timer_t *timer = (timer_t *)calloc(sizeof(timer_t), 1);
+    timer_t *timer = (timer_t *)calloc(1, sizeof(timer_t));
     if (!timer)
     {
         return NULL;
@@ -133,7 +153,17 @@ timer_t *timerwheel::add_timer(uint64_t timeout, void *conn) noexcept
     return timer;
 }
 
-int timerwheel::handle_timeouts() noexcept
+void cancel(timer_t *timer)
+{
+    if (timer)
+    {
+        timer->cancelled = true;
+    }
+
+    timer = nullptr;
+}
+
+int handle_timeouts() noexcept
 {
     if (num_timers == 0)
     {
@@ -141,6 +171,7 @@ int timerwheel::handle_timeouts() noexcept
     }
 
     int i = 0;
+    int res = 0;
 
     level_t *level;
 
@@ -163,11 +194,10 @@ int timerwheel::handle_timeouts() noexcept
 
             if (current->expiry <= current_tick)
             {
-                int res = quic::handle_expiry(msg, (connection *)current->conn, current->expiry);
-
-                if (msg)
+                res = worker::enqueue_write((connection *)current->conn, current->expiry);
+                if (res != 0)
                 {
-                    res = server::prepare_write(msg);
+                    return res;
                 }
 
                 if (res != 0)
@@ -223,7 +253,7 @@ int timerwheel::handle_timeouts() noexcept
     return 0;
 }
 
-void timerwheel::insert_timer(timer_t *timer, uint8_t level_index) noexcept
+static void insert_timer(timer_t *timer, uint8_t level_index) noexcept
 {
     level_t &level = levels[level_index];
     uint16_t index = (timer->expiry / (level.interval) % level.num_buckets);
@@ -231,5 +261,6 @@ void timerwheel::insert_timer(timer_t *timer, uint8_t level_index) noexcept
     level.buckets[index].head = timer;
 }
 
+}; // namespace timer
 }; // namespace networking
 }; // namespace faim

@@ -2,7 +2,6 @@
 
 #pragma once
 
-#include "helper.hpp"
 #include <cstdint>
 #include <cstring>
 #include <liburing.h>
@@ -15,39 +14,41 @@ namespace faim
 namespace networking
 {
 
+/* -------------------------------------------- MACRO DECLARATIONS -------------------------------------------------- */
+
 /* Event types macros */
-#define READ 0
-#define EVENT 1
+
+#define READ 1
+
+#define READ_SUCCESSFUL 0
+
 #define WRITE 2
-#define TIMER 3
+
+#define WRITE_SUCCESSFUL 0
+
+#define EVENT 3
+
+#define TIMER 4
 
 /* Action specific macros */
+
 #define STREAM_DONE 1
+
 #define RESPOND -1
+
 #define DROP -2
+
 #define MAX_TRIES 3
 
 #define BACKLOG 128
+
 #define PORT 8060
+
 #define ALLOW_IPV4 0 // [0 = yes | 1 = no]
 
 #define CONTROLLEN 0
 
-#define SQES 64
-#define CQES (SQES * 16)
-#define BUFFERS CQES
-#define BUFFER_SHIFT 12 // 4KB
-#define BUFFER_SIZE (1U << BUFFER_SHIFT)
-#define BUFFER_RING_SIZE ((sizeof(struct io_uring_buf) + BUFFER_SIZE) * BUFFERS)
-
-#define READ_SUCCESSFUL 0
-#define WRITE_SUCCESSFUL 0
-
-inline ngtcp2_ccerr app_error;
-
-struct connection;
-
-typedef uint64_t timestamp_t;
+/* ------------------------------------------- STRUCT DECLARATIONS -------------------------------------------------- */
 
 union sockaddr_u
 {
@@ -83,99 +84,18 @@ inline struct local
 
 } local;
 
-struct uvarint_t
+struct msghdr_t : msghdr
 {
-    union uvarint
-    {
-        uint8_t n8;
+    iovec iov;
 
-        uint16_t n16;
-
-        uint32_t n32;
-
-        uint64_t n64;
-    } v{};
-
-    size_t len;
-
-    uvarint_t() = default;
-
-    uvarint_t(const uint8_t *start)
-    {
-        len = (size_t)(1u << (*start >> 6));
-
-        switch (len)
-        {
-        case 1:
-            memcpy(&v, start, 1);
-            break;
-        case 2:
-            memcpy(&v, start, 2);
-            v.n8 &= 0x3f;
-            v.n16 = ntohs(v.n16);
-            break;
-        case 4:
-            memcpy(&v, start, 4);
-            v.n8 &= 0x3f;
-            v.n32 = ntohl(v.n32);
-            break;
-        case 8:
-            memcpy(&v, start, 8);
-            v.n8 &= 0x3f;
-            v.n64 = ntohll(v.n64);
-            break;
-        }
-    }
-
-    static size_t length(const uint8_t *start)
-    {
-        return (size_t)(1u << (*start >> 6));
-    }
-
-    operator uint64_t() const noexcept
-    {
-        return v.n64;
-    }
-    bool operator==(uint64_t comp) const noexcept
-    {
-        return v.n64 == comp;
-    }
-};
-
-struct quic_hd
-{
-    ngtcp2_cid dcid;
-
-    ngtcp2_cid scid;
-
-    ngtcp2_cid odcid;
-
-    uint32_t version;
-
-    uvarint_t token;
-
-    ngtcp2_token_type token_type;
-};
-
-struct msgctr
-{
-    uint8_t type;
-
+    uint16_t total_bytes;
+    uint16_t bytes_send;
+    uint8_t ring_num;
+    uint8_t num_buf;
+    uint8_t start_buf;
     uint8_t tries;
 
-    ssize_t bytes_send;
-
-    ssize_t total_bytes;
-};
-
-struct quic_dc
-{
-    connection *conn;
-    ngtcp2_path path;
-    uint8_t *pkt;
-    size_t pktlen;
-    ngtcp2_pkt_info pi;
-    uint64_t timestamp;
+    msghdr_t *next;
 };
 
 struct error
@@ -188,6 +108,14 @@ struct error
     {
     }
 };
+
+/* ------------------------------------------ VARIABLES DECLARATIONS ------------------------------------------------ */
+
+struct connection;
+
+typedef uint64_t timestamp_t;
+
+/* ------------------------------------------------------------------------------------------------------------------ */
 
 }; // namespace networking
 }; // namespace faim

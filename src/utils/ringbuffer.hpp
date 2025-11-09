@@ -2,143 +2,161 @@
 
 #pragma once
 
-#include "../middleware/connection.hpp"
-#include "../middleware/quic/encoder.hpp"
-#include "../middleware/stream.hpp"
-#include <cerrno>
-#include <cstdlib>
-#include <string.h>
+#include <sys/mman.h>
 
-using namespace faim::networking;
+#include "bitmap.hpp"
+#include "types.hpp"
 
-class ringbuf_t
+namespace faim
 {
-    stream_t **base = nullptr;
+namespace networking
+{
+namespace ringbuf
+{
 
-    size_t head = 0;
+#define BUFFERS 256
 
-    size_t tail = 0;
+#define N_BITMAP BUFFERS / 64
 
-    size_t size = 8;
+#define BUFFER_SHIFT 12 // 4KB
 
-    size_t num_items = 0;
+#define BUFFER_SIZE (1U << BUFFER_SHIFT)
 
-  public:
-    int construct()
-    {
-        base = (stream_t **)calloc(size, sizeof(stream_t *));
-        if (!base)
-        {
-            return -errno;
-        }
+#define BUFFER_RING_SIZE (sizeof(struct buf_ring_t) + (BUFFERS * BUFFER_SIZE))
 
-        return 0;
-    }
+#define CMSG_LENGTH CMSG_SPACE(sizeof(uint8_t))
 
-    operator bool()
-    {
-        return num_items <= 0;
-    }
-
-    int push(stream_t *item)
-    {
-        size_t next = ((head + 1) & (size - 1));
-
-        if (next == tail)
-        {
-            size_t new_size = size * 2;
-
-            stream_t **tmp = (stream_t **)realloc(base, sizeof(stream_t *) * new_size);
-            if (!tmp)
-            {
-                return -errno;
-            }
-
-            base = tmp;
-            size = new_size;
-            next = (head + 1) & (size - 1);
-        }
-
-        num_items++;
-        base[head] = item;
-        head = next;
-        return 0;
-    }
-
-    ssize_t flush_and_process(connection *conn, ngtcp2_path *path, ngtcp2_pkt_info *pi, uint8_t *data, size_t datalen,
-                              size_t max_pkt_size, uint64_t ts)
-    {
-        if (head == tail)
-        {
-            return 0;
-        }
-
-        size_t read = tail;
-        size_t write = 0;
-
-        stream_t **tmp = (stream_t **)malloc(sizeof(stream_t *) * size);
-
-        if (tmp)
-        {
-            while (read != head)
-            {
-                stream_t *item = base[read];
-
-                auto res = quic::write_pkt(conn, item, path, pi, data, datalen, max_pkt_size, ts);
-                if (res < 0)
-                {
-                    return res;
-                }
-
-                tmp[write++] = item;
-                read = (read + 1) & (size - 1);
-            }
-
-            memcpy(base, tmp, write * sizeof(stream_t *));
-            free(tmp);
-        }
-        else
-        {
-            while (read != head)
-            {
-                stream_t *item = base[read];
-
-                auto res = quic::write_pkt(conn, item, path, pi, data, datalen, max_pkt_size, ts);
-                if (res < 0)
-                {
-                    return res;
-                }
-
-                if (read != write)
-                {
-                    base[write] = item;
-                }
-
-                read = (read + 1) & (size - 1);
-                write++;
-            }
-        }
-
-        tail = 0;
-        head = write;
-
-        if (write < size / 2 && size > 8)
-        {
-            size_t new_size = size / 2;
-            stream_t **resized = (stream_t **)realloc(base, sizeof(stream_t *) * new_size);
-            if (resized)
-            {
-                base = resized;
-                size = new_size;
-            }
-        }
-    }
-
-    void destruct()
-    {
-        if (base)
-        {
-            free(base);
-        }
-    }
+struct buf_ring_t
+{
+    uint64_t bitmap[N_BITMAP];
+    uint8_t *base;
+    iovec reg;
+    uint8_t head = 0;
+    uint8_t num = 0;
 };
+
+inline int setup(buf_ring_t **buf_ring_r, io_uring *ring_r) noexcept
+{
+    void *mem = mmap(nullptr, BUFFER_RING_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
+
+    if (mem == MAP_FAILED)
+    {
+        return -errno;
+    }
+
+    buf_ring_t *bufring = (buf_ring_t *)mem;
+
+    io_uring_rsrc_register reg = {
+        .nr = 1,
+        .flags = 0,
+        .data = (__aligned_u64)&bufring->reg,
+        .tags = 0,
+    };
+
+    int res = io_uring_register(ring_r->ring_fd, IORING_REGISTER_BUFFERS2, &reg, sizeof(reg));
+    if (res < 0)
+    {
+        return res;
+    }
+
+    return 0;
+}
+
+inline void cleanup(buf_ring_t *buf_ring) noexcept
+{
+    if (buf_ring && buf_ring != MAP_FAILED)
+    {
+        munmap(buf_ring, BUFFER_RING_SIZE);
+    }
+}
+
+inline msghdr_t *claim_buffer(buf_ring_t *ring, uint8_t *&dest, size_t &destlen, uint8_t ecn) noexcept
+{
+    if (destlen == 0)
+    {
+        return nullptr;
+    }
+
+    int num_bufs = (destlen + BUFFER_SIZE - 1) >> BUFFER_SHIFT;
+
+    if (num_bufs >= BUFFERS)
+    {
+        num_bufs = BUFFERS;
+    }
+
+    size_t last_buf_fill = destlen & (BUFFER_SIZE - 1);
+
+    if (last_buf_fill && last_buf_fill < (BUFFER_SIZE >> 1))
+    {
+        num_bufs--;
+    }
+
+    int start_index = bitmap::claim(ring->bitmap, num_bufs);
+
+    if (start_index == -1)
+    {
+        return nullptr;
+    }
+
+    dest = ring->base + ((start_index) & (BUFFERS - 1)) * BUFFER_SIZE;
+    destlen = num_bufs * BUFFER_SIZE;
+
+    msghdr_t *msg = (msghdr_t *)dest;
+
+    if (ecn)
+    {
+        cmsghdr *cmsg = (cmsghdr *)(msg + 1);
+
+        msg->msg_control = cmsg;
+        msg->msg_controllen = CMSG_SPACE(sizeof(uint8_t));
+
+        *cmsg = (cmsghdr){
+            .cmsg_len = CMSG_SPACE(sizeof(ecn)),
+            .cmsg_level = IPPROTO_IPV6,
+            .cmsg_type = IPV6_TCLASS,
+        };
+
+        uint8_t *ecn_ptr = (uint8_t *)CMSG_DATA(cmsg);
+        *ecn_ptr = ecn;
+    }
+
+    msg->msg_iov = &msg->iov;
+    msg->msg_iovlen = 1;
+
+    msg->iov.iov_base = dest + sizeof(msghdr_t);
+    msg->iov.iov_len = destlen - sizeof(msghdr_t);
+
+    msg->total_bytes = destlen;
+    msg->ring_num = ring->num;
+    msg->num_buf = (uint8_t)num_bufs;
+
+    ring->head = start_index + num_bufs;
+
+    return msg;
+}
+
+inline int resize_buffer(buf_ring_t *ring, msghdr_t *msg) noexcept
+{
+    uint8_t *start = ring->base + ((msg->start_buf) & (BUFFERS - 1)) * BUFFER_SIZE;
+
+    memset(start, 0, BUFFER_SIZE * msg->num_buf);
+
+    bitmap::release(ring->bitmap, msg->start_buf, msg->num_buf);
+
+    return 0;
+}
+
+inline void release_buffer(buf_ring_t *ring, msghdr_t *&msg) noexcept
+{
+    uint8_t *start = ring->base + ((msg->start_buf) & (BUFFERS - 1)) * BUFFER_SIZE;
+
+    bitmap::release(ring->bitmap, msg->start_buf, msg->num_buf);
+
+    memset(start, 0, BUFFER_SIZE * msg->num_buf);
+
+    msg = nullptr;
+}
+
+}; // namespace ringbuf
+}; // namespace networking
+}; // namespace faim

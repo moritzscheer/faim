@@ -15,9 +15,9 @@ namespace http
 
 static inline nghttp3_settings *default_settings;
 
-int context_init();
+int setup();
 
-void context_free();
+void cleanup();
 
 int session_new(connection *c);
 

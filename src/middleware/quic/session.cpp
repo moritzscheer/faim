@@ -3,7 +3,6 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
-#include <system_error>
 
 #include <nghttp3/nghttp3.h>
 #include <ngtcp2/ngtcp2.h>
@@ -14,16 +13,16 @@
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 
-#include "../../core/buffer.hpp"
-#include "../../core/server.hpp"
 #include "../../core/timer.hpp"
+#include "../../core/write.hpp"
 #include "../../utils/helper.hpp"
 #include "../../utils/types.hpp"
 #include "../connection.hpp"
+#include "../http/decoder.hpp"
 #include "../http/session.hpp"
 #include "../quic/encoder.hpp"
 #include "../webt/decoder.hpp"
-#include "../webt/session.hpp"
+#include "decoder.hpp"
 #include "session.hpp"
 
 namespace faim
@@ -33,7 +32,9 @@ namespace networking
 namespace quic
 {
 
-int context_init()
+using namespace timer;
+
+int setup()
 {
     int res = RAND_bytes(secret, SECRET_LEN);
     if (res != 0)
@@ -119,7 +120,7 @@ int context_init()
     return 0;
 }
 
-void context_free()
+void cleanup()
 {
     SSL_CTX_free(ssl_ctx);
 
@@ -206,12 +207,19 @@ void delete_session(ngtcp2_conn *conn)
     }
 }
 
-int update_timer(connection *conn, uint64_t &timestamp, uint8_t &action)
+ssize_t conn_set_application_error(ngtcp2_ccerr *ccerr, int err)
 {
-    int res = get_timestamp_ns(timestamp);
-    if (res < 0)
+    ngtcp2_ccerr_set_application_error(ccerr, nghttp3_err_infer_quic_app_error_code(static_cast<int>(err)), nullptr, 0);
+
+    return NGTCP2_ERR_CALLBACK_FAILURE;
+}
+
+int update_timer(connection *conn, uint64_t &ts, uint8_t &action)
+{
+    ts = get_timestamp_ns();
+    if (ts <= 0)
     {
-        return res;
+        return ts;
     }
 
     if (ngtcp2_conn_in_closing_period(conn->quic) || ngtcp2_conn_in_draining_period(conn->quic))
@@ -221,9 +229,9 @@ int update_timer(connection *conn, uint64_t &timestamp, uint8_t &action)
 
     uint64_t expiry = ngtcp2_conn_get_expiry(conn->quic);
 
-    if (expiry <= timestamp)
+    if (expiry <= ts)
     {
-        res = ngtcp2_conn_handle_expiry(conn->quic, timestamp);
+        res = ngtcp2_conn_handle_expiry(conn->quic, ts);
         if (res == NGTCP2_ERR_IDLE_CLOSE)
         {
             close_connection(conn);
@@ -236,7 +244,14 @@ int update_timer(connection *conn, uint64_t &timestamp, uint8_t &action)
         conn->timer->cancelled = false;
     }
 
-    conn->timer = timerwheel::add_timer(expiry, conn);
+    timer_t *timer = timer::add(expiry, conn);
+
+    if (!timer)
+    {
+        return -ENOMEM;
+    }
+
+    conn->timer = timer;
 
     if (action == READ)
     {
@@ -246,99 +261,32 @@ int update_timer(connection *conn, uint64_t &timestamp, uint8_t &action)
     return 0;
 }
 
-int handle_expiry(msghdr *&msg, connection *conn, uint64_t ts)
-{
-    if (!conn)
-    {
-        return 0;
-    }
-
-    int res = ngtcp2_conn_handle_expiry(conn->quic, ts);
-    if (res == NGTCP2_ERR_IDLE_CLOSE)
-    {
-        close_connection(conn);
-        return 0;
-    }
-
-    size_t pktlen = ngtcp2_conn_get_send_quantum(conn->quic);
-    if (pktlen <= 0)
-    {
-        return 0;
-    }
-
-    uint8_t *pkt = (uint8_t *)calloc(pktlen, sizeof(uint8_t));
-    if (!pkt)
-    {
-        return -errno;
-    }
-
-    const ngtcp2_path *path = ngtcp2_conn_get_path(conn->quic);
-
-    size_t gso = 0;
-
-    res = ngtcp2_conn_write_aggregate_pkt(conn->quic, &path, &conn->pi, pkt, pktlen, &gso, quic::write_pkt, ts);
-
-    switch (res)
-    {
-    case WRITE_SUCCESSFUL:
-    {
-        msg = buffer(pkt, pktlen, gso);
-        res = server::prepare_write(msg);
-        return res;
-    }
-    case NGTCP2_ERR_NOMEM:
-    {
-        free(pkt);
-        return -errno;
-    }
-    case NGTCP2_ERR_PKT_NUM_EXHAUSTED:
-    {
-        free(pkt);
-    }
-    case NGTCP2_ERR_CALLBACK_FAILURE:
-    {
-        free(pkt);
-
-        return 0;
-    }
-    case NGTCP2_ERR_INVALID_ARGUMENT:
-    {
-        return 0;
-    }
-    case NGTCP2_ERR_WRITE_MORE:
-    {
-        free(pkt);
-        return 0;
-    }
-    default:
-    {
-        free(pkt);
-        return 0;
-    }
-    }
-}
-
 /* ========================================================================= */
 /*                          Callback Functions                               */
 /* ========================================================================= */
 
-static int handshake_completed(ngtcp2_conn *quic, void *user_data)
+int handshake_completed(ngtcp2_conn *quic, void *user_data)
 {
     connection *conn = reinterpret_cast<connection *>(user_data);
+
+    uint64_t timestamp = get_timestamp_ns();
+    if (!timestamp)
+    {
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
 
     const ngtcp2_path *path = ngtcp2_conn_get_path(quic);
 
     uint8_t token[NGTCP2_CRYPTO_MAX_REGULAR_TOKENLEN];
     ssize_t tokenlen = ngtcp2_crypto_generate_regular_token(token, SECRET, SECRET_LEN, path->remote.addr,
-                                                            path->remote.addrlen, get_timestamp_ns());
+                                                            path->remote.addrlen, timestamp);
 
     if (tokenlen < 0)
     {
-        return 0;
+        return NGTCP2_ERR_CALLBACK_FAILURE;
     }
 
-    int res = ngtcp2_conn_submit_new_token(quic, token, (size_t)tokenlen);
-    if (res != 0)
+    if (ngtcp2_conn_submit_new_token(quic, token, (size_t)tokenlen) != 0)
     {
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
@@ -346,69 +294,66 @@ static int handshake_completed(ngtcp2_conn *quic, void *user_data)
     return 0;
 }
 
-static int recv_stream_data(ngtcp2_conn *c, uint32_t flags, int64_t stream_id, uint64_t offset, const uint8_t *data,
-                            size_t datalen, void *user_data, void *stream_user_data)
+int recv_stream_data(ngtcp2_conn *quic, uint32_t flags, int64_t stream_id, uint64_t offset, const uint8_t *data,
+                     size_t datalen, void *user_data, void *stream_user_data)
 {
     connection *conn = reinterpret_cast<connection *>(user_data);
-    stream_t *stream = reinterpret_cast<stream_t *>(stream_user_data);
 
-    size_t nconsumed = parse_stream_header(conn, stream, flags, data, datalen);
-    if (nconsumed == HTTP)
+    stream_t *stream;
+
+    int res = parse_stream_data_header(stream, conn, stream_id, data, datalen, stream_user_data);
+    if (res != 0)
     {
-        nconsumed = nghttp3_conn_read_stream2(conn->http, stream_id, data, datalen, flags, get_timestamp_ns());
+        return res;
     }
 
-    if (nconsumed < 0)
+    uint64_t ts = get_timestamp_ns();
+    if (ts)
     {
-        ngtcp2_ccerr_set_application_error(&app_error, infer_quic_error_code(static_cast<int>(nconsumed)), nullptr, 0);
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
 
-    if (nconsumed > 0)
+    switch (stream->type)
     {
-        ngtcp2_conn_extend_max_stream_offset(c, stream_id, static_cast<uint64_t>(nconsumed));
-        ngtcp2_conn_extend_max_offset(c, static_cast<uint64_t>(nconsumed));
+    case HTTP:
+    {
+        return http::read_stream(conn, stream_id, data, datalen, flags, ts);
     }
-
-    return 0;
+    case WEBTRANSPORT:
+    {
+        return webt::read_stream(conn, stream_id, data, datalen, flags, ts);
+    }
+    default:
+    {
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    }
 }
 
-int acked_stream_data_offset(ngtcp2_conn *c, int64_t stream_id, uint64_t offset, uint64_t datalen, void *user_data,
+int acked_stream_data_offset(ngtcp2_conn *quic, int64_t stream_id, uint64_t offset, uint64_t datalen, void *user_data,
                              void *stream_user_data)
 {
     connection *conn = reinterpret_cast<connection *>(user_data);
     stream_t *stream = reinterpret_cast<stream_t *>(stream_user_data);
 
-    int res;
-
-    if (stream->type == WEBTRANSPORT)
+    switch (stream->type)
     {
-        res = stream->ack_data(offset);
+    case HTTP:
+    {
+        return http::add_ack_offset(conn, stream_id, offset);
     }
-    else if (conn->http)
+    case WEBTRANSPORT:
     {
-        res = nghttp3_conn_add_ack_offset(conn->http, stream_id, offset);
+        return webt::add_ack_offset(conn, stream_id, offset);
     }
-
-    return res == 0 ? res : NGTCP2_ERR_CALLBACK_FAILURE;
-}
-
-int stream_open(ngtcp2_conn *c, int64_t stream_id, void *user_data)
-{
-    connection *conn = reinterpret_cast<connection *>(user_data);
-
-    stream_t *stream = stream_t::create(stream_id);
-    if (!stream)
+    default:
     {
-        ngtcp2_ccerr_set_application_error(conn->error, NGHTTP3_H3_INTERNAL_ERROR, NULL, 0);
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
-
-    ngtcp2_conn_set_stream_user_data(c, stream_id, stream);
-    return 0;
+    }
 }
 
-int stream_close(ngtcp2_conn *c, uint32_t flags, int64_t stream_id, uint64_t err, void *user_data,
+int stream_close(ngtcp2_conn *quic, uint32_t flags, int64_t stream_id, uint64_t err, void *user_data,
                  void *stream_user_data)
 {
     connection *conn = reinterpret_cast<connection *>(user_data);
@@ -419,55 +364,24 @@ int stream_close(ngtcp2_conn *c, uint32_t flags, int64_t stream_id, uint64_t err
         err = NGHTTP3_H3_NO_ERROR;
     }
 
-    int res;
-
-    if (stream->type == WEBTRANSPORT)
+    switch (stream->type)
     {
-        res = ngwebtr_conn_close_stream(conn, stream);
+    case HTTP:
+    {
+        return http::close_stream(conn, stream, err);
     }
-    else if (conn->http)
+    case WEBTRANSPORT:
     {
-        res = nghttp3_conn_close_stream(conn->http, stream_id, err);
-    }
-
-    switch (res)
-    {
-    case 0:
-    {
-
-        if (ngtcp2_is_bidi_stream(stream_id))
-        {
-            ngtcp2_conn_extend_max_streams_bidi(c, 1);
-        }
-        else
-        {
-            ngtcp2_conn_extend_max_streams_uni(c, 1);
-        }
-
-        stream->close_stream();
-        return 0;
-    }
-    case NGHTTP3_ERR_STREAM_NOT_FOUND:
-    {
-
-        if (ngtcp2_is_bidi_stream(stream_id))
-        {
-            ngtcp2_conn_extend_max_streams_bidi(c, 1);
-        }
-        else
-        {
-            ngtcp2_conn_extend_max_streams_uni(c, 1);
-        }
-
-        return 0;
+        return webt::close_stream(conn, stream, err);
     }
     default:
-        ngtcp2_ccerr_set_application_error(conn->error, infer_quic_error_code(res), nullptr, 0);
+    {
         return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
     }
 }
 
-static void rand(uint8_t *dest, size_t destlen, const ngtcp2_rand_ctx *ctx)
+void rand(uint8_t *dest, size_t destlen, const ngtcp2_rand_ctx *ctx)
 {
     if (RAND_bytes(dest, static_cast<int>(destlen)) != 1)
     {
@@ -475,11 +389,11 @@ static void rand(uint8_t *dest, size_t destlen, const ngtcp2_rand_ctx *ctx)
     }
 }
 
-static int get_new_connection_id(ngtcp2_conn *c, ngtcp2_cid *cid, uint8_t *token, size_t cidlen, void *user_data)
+int get_new_connection_id(ngtcp2_conn *quic, ngtcp2_cid *cid, uint8_t *token, size_t cidlen, void *user_data)
 {
     connection *conn = reinterpret_cast<connection *>(user_data);
 
-    if (RAND_bytes(cid->data, static_cast<int>(cidlen)) != 1)
+    if (RAND_bytes(cid->data, cidlen) != 1)
     {
         NGTCP2_ERR_CALLBACK_FAILURE;
     }
@@ -491,18 +405,10 @@ static int get_new_connection_id(ngtcp2_conn *c, ngtcp2_cid *cid, uint8_t *token
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
 
-    connections.swap(conn->id, *cid);
-
-    return 0;
+    return add_connection_id(conn, cid);
 }
 
-int remove_connection_id(ngtcp2_conn *c, const ngtcp2_cid *cid, void *user_data)
-{
-    connections.del(*cid);
-    return 0;
-}
-
-int path_validation(ngtcp2_conn *conn, uint32_t flags, const ngtcp2_path *path, const ngtcp2_path *old_path,
+int path_validation(ngtcp2_conn *quic, uint32_t flags, const ngtcp2_path *path, const ngtcp2_path *old_path,
                     ngtcp2_path_validation_result pv_res, void *user_data)
 {
     if (pv_res != NGTCP2_PATH_VALIDATION_RESULT_SUCCESS || !(flags & NGTCP2_PATH_VALIDATION_FLAG_NEW_TOKEN))
@@ -510,18 +416,24 @@ int path_validation(ngtcp2_conn *conn, uint32_t flags, const ngtcp2_path *path, 
         return 0;
     }
 
-    std::array<uint8_t, NGTCP2_CRYPTO_MAX_REGULAR_TOKENLEN> token;
-    ngtcp2_tstamp ts = get_timestamp_ns();
+    connection *conn = reinterpret_cast<connection *>(user_data);
 
-    ssize_t tokenlen = ngtcp2_crypto_generate_regular_token(token.data(), SECRET, SECRET_LEN, path->remote.addr,
-                                                            path->remote.addrlen, ts);
-    if (tokenlen < 0)
+    uint64_t timestamp = get_timestamp_ns();
+    if (timestamp == UINT64_MAX)
     {
-        return 0;
+        return NGTCP2_ERR_CALLBACK_FAILURE;
     }
 
-    int res = ngtcp2_conn_submit_new_token(conn, token.data(), (size_t)tokenlen);
-    if (res != 0)
+    uint8_t token[NGTCP2_CRYPTO_MAX_REGULAR_TOKENLEN];
+    ssize_t tokenlen = ngtcp2_crypto_generate_regular_token(token, SECRET, SECRET_LEN, path->remote.addr,
+                                                            path->remote.addrlen, timestamp);
+
+    if (tokenlen < 0)
+    {
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+
+    if (ngtcp2_conn_submit_new_token(quic, token, (size_t)tokenlen) != 0)
     {
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
@@ -529,69 +441,92 @@ int path_validation(ngtcp2_conn *conn, uint32_t flags, const ngtcp2_path *path, 
     return 0;
 }
 
-int stream_reset(ngtcp2_conn *c, int64_t stream_id, uint64_t final_size, uint64_t err, void *user_data,
+int stream_reset(ngtcp2_conn *quic, int64_t stream_id, uint64_t final_size, uint64_t err, void *user_data,
                  void *stream_user_data)
 {
     connection *conn = reinterpret_cast<connection *>(user_data);
     stream_t *stream = reinterpret_cast<stream_t *>(stream_user_data);
 
-    int res;
-
-    if (stream->type == WEBTRANSPORT)
+    switch (stream->type)
     {
-        res = ngwebtr_conn_close_stream(conn, stream);
-    }
-    else if (conn->http)
+    case HTTP:
     {
-        int res = nghttp3_conn_shutdown_stream_read(conn->http, stream_id);
+        return http::reset_stream(conn, stream_id);
     }
-
-    return res == 0 ? res : NGTCP2_ERR_CALLBACK_FAILURE;
-}
-
-int extend_max_remote_streams_bidi(ngtcp2_conn *c, uint64_t max_streams, void *user_data)
-{
-    connection *conn = reinterpret_cast<connection *>(user_data);
-
-    if (conn->http)
+    case WEBTRANSPORT:
     {
-        nghttp3_conn_set_max_client_streams_bidi(conn->http, max_streams);
+        return webt::reset_stream(conn, stream_id);
     }
-
-    return 0;
-}
-
-int extend_max_stream_data(ngtcp2_conn *c, int64_t stream_id, uint64_t max_data, void *user_data,
-                           void *stream_user_data)
-{
-    connection *conn = reinterpret_cast<connection *>(user_data);
-
-    int res = nghttp3_conn_unblock_stream(conn->http, stream_id);
-    if (res != 0)
+    default:
     {
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
-
-    return 0;
+    }
 }
 
-int stream_stop_sending(ngtcp2_conn *c, int64_t stream_id, uint64_t err, void *user_data, void *stream_user_data)
+int extend_max_remote_streams_bidi(ngtcp2_conn *quic, uint64_t max_streams, void *user_data)
 {
     connection *conn = reinterpret_cast<connection *>(user_data);
 
     if (conn->http)
     {
-        int res = nghttp3_conn_shutdown_stream_read(conn->http, stream_id);
-        if (res != 0)
-        {
-            return NGTCP2_ERR_CALLBACK_FAILURE;
-        }
+        http::set_max_streams_bidi(conn, max_streams);
+    }
+
+    if (conn->webt)
+    {
+        webt::set_max_streams_bidi(conn, max_streams);
     }
 
     return 0;
 }
 
-int recv_tx_key(ngtcp2_conn *c, ngtcp2_encryption_level level, void *user_data)
+int extend_max_stream_data(ngtcp2_conn *quic, int64_t stream_id, uint64_t max_data, void *user_data,
+                           void *stream_user_data)
+{
+    connection *conn = reinterpret_cast<connection *>(user_data);
+    stream_t *stream = reinterpret_cast<stream_t *>(stream_user_data);
+
+    switch (stream->type)
+    {
+    case HTTP:
+    {
+        return http::unblock_stream(conn, stream_id);
+    }
+    case WEBTRANSPORT:
+    {
+        return webt::unblock_stream(conn, stream_id);
+    }
+    default:
+    {
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    }
+}
+
+int stream_stop_sending(ngtcp2_conn *quic, int64_t stream_id, uint64_t err, void *user_data, void *stream_user_data)
+{
+    connection *conn = reinterpret_cast<connection *>(user_data);
+    stream_t *stream = reinterpret_cast<stream_t *>(stream_user_data);
+
+    switch (stream->type)
+    {
+    case HTTP:
+    {
+        return http::shutdown_stream(conn, stream_id);
+    }
+    case WEBTRANSPORT:
+    {
+        return webt::shutdown_stream(conn, stream_id);
+    }
+    default:
+    {
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    }
+}
+
+int recv_tx_key(ngtcp2_conn *quic, ngtcp2_encryption_level level, void *user_data)
 {
     if (level != NGTCP2_ENCRYPTION_LEVEL_1RTT)
     {
@@ -689,7 +624,7 @@ ngtcp2_callbacks callbacks = {
      * when new remote stream is opened by a remote endpoint.  This
      * callback function is optional.
      */
-    stream_open,
+    NULL, // NOT NEEDED Streams are created when data is received
 
     /**
      * [stream_close] is a callback function which is invoked

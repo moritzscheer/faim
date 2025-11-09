@@ -18,30 +18,16 @@ namespace faim
 namespace networking
 {
 
-inline ngtcp2_tstamp get_timestamp_ns()
+inline uint64_t get_timestamp_ns()
 {
     struct timespec ts;
 
     if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
     {
-        return 0;
+        return UINT64_MAX;
     }
 
-    return ts.tv_sec * (int64_t)NGTCP2_SECONDS + ts.tv_nsec;
-}
-
-inline int get_timestamp_ns(ngtcp2_tstamp timestamp)
-{
-    struct timespec ts;
-
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
-    {
-        return -errno;
-    }
-
-    timestamp = ts.tv_sec * (int64_t)NGTCP2_SECONDS + ts.tv_nsec;
-
-    return 0;
+    return ts.tv_sec * (uint64_t)NGTCP2_SECONDS + ts.tv_nsec;
 }
 
 inline ngtcp2_pkt_info io_uring_get_ecn(io_uring_recvmsg_out *msg_out, struct msghdr *msgh, int family)
@@ -119,14 +105,6 @@ inline extern ngtcp2_path ngtcp2_path_create(sockaddr_storage *addr, socklen_t a
     };
 
     return path;
-}
-
-inline uint64_t ntohll(uint64_t netlong64)
-{
-    return ((netlong64 & 0xFF00000000000000ULL) >> 56) | ((netlong64 & 0x00FF000000000000ULL) >> 40) |
-           ((netlong64 & 0x0000FF0000000000ULL) >> 24) | ((netlong64 & 0x000000FF00000000ULL) >> 8) |
-           ((netlong64 & 0x00000000FF000000ULL) << 8) | ((netlong64 & 0x0000000000FF0000ULL) << 24) |
-           ((netlong64 & 0x000000000000FF00ULL) << 40) | ((netlong64 & 0x00000000000000FFULL) << 56);
 }
 
 }; // namespace networking

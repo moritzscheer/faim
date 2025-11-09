@@ -4,11 +4,9 @@
 #include <nghttp3/nghttp3.h>
 #include <ngtcp2/ngtcp2.h>
 #include <openssl/rand.h>
-#include <system_error>
 
 #include "../../utils/types.hpp"
 #include "../connection.hpp"
-#include "encoder.hpp"
 
 namespace faim
 {
@@ -17,7 +15,7 @@ namespace networking
 namespace http
 {
 
-int context_init()
+int setup()
 {
     int res;
 
@@ -28,9 +26,11 @@ int context_init()
     }
 
     nghttp3_settings_default(default_settings);
+
+    return 0;
 }
 
-void context_free()
+void cleanup()
 {
     if (default_settings)
     {
@@ -38,73 +38,76 @@ void context_free()
     }
 }
 
-int session_new(connection *c)
+int session_new(connection *conn)
 {
-    nghttp3_conn *conn;
+    nghttp3_conn *http;
     nghttp3_settings settings;
 
     memcpy(&settings, default_settings, sizeof(nghttp3_settings));
     settings.qpack_max_dtable_capacity = 4096;
     settings.qpack_blocked_streams = 100;
 
-    if (nghttp3_conn_server_new(&conn, &callbacks, &settings, NULL, c) != 0)
+    if (nghttp3_conn_server_new(&http, &callbacks, &settings, NULL, conn) != 0)
     {
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
 
-    const ngtcp2_transport_params *params = ngtcp2_conn_get_local_transport_params(c->quic);
-    nghttp3_conn_set_max_client_streams_bidi(conn, params->initial_max_streams_bidi);
+    const ngtcp2_transport_params *params = ngtcp2_conn_get_local_transport_params(conn->quic);
+    nghttp3_conn_set_max_client_streams_bidi(http, params->initial_max_streams_bidi);
 
-    /* need 3 unidirectional streams for http3 */
-    if (ngtcp2_conn_get_streams_uni_left(c->quic) <= 3)
+    /* need 1 unidirectional streams for the control stream */
+
+    if (ngtcp2_conn_get_streams_uni_left(conn->quic) <= 3)
     {
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
 
     int64_t control_stream_id;
 
-    int res = ngtcp2_conn_open_uni_stream(c->quic, &control_stream_id, nullptr);
+    int res = ngtcp2_conn_open_uni_stream(conn->quic, &control_stream_id, nullptr);
     if (res != 0)
     {
         return res;
     }
 
-    res = nghttp3_conn_bind_control_stream(conn, control_stream_id);
+    res = nghttp3_conn_bind_control_stream(http, control_stream_id);
     if (res != 0)
     {
         return res;
     }
+
+    /* need 2 unidirectional streams for the qpack encoder and decoder stream */
 
     int64_t qpack_enc_stream_id, qpack_dec_stream_id;
 
-    res = ngtcp2_conn_open_uni_stream(c->quic, &qpack_enc_stream_id, nullptr);
+    res = ngtcp2_conn_open_uni_stream(conn->quic, &qpack_enc_stream_id, nullptr);
     if (res != 0)
     {
         return res;
     }
 
-    res = ngtcp2_conn_open_uni_stream(c->quic, &qpack_dec_stream_id, nullptr);
+    res = ngtcp2_conn_open_uni_stream(conn->quic, &qpack_dec_stream_id, nullptr);
     if (res != 0)
     {
         return res;
     }
 
-    res = nghttp3_conn_bind_qpack_streams(conn, qpack_enc_stream_id, qpack_dec_stream_id);
+    res = nghttp3_conn_bind_qpack_streams(http, qpack_enc_stream_id, qpack_dec_stream_id);
     if (res != 0)
     {
         return res;
     }
 
-    c->http = conn;
+    conn->http = http;
 
     return 0;
 }
 
-void session_del(nghttp3_conn *conn)
+void session_del(nghttp3_conn *http)
 {
-    if (conn)
+    if (http)
     {
-        nghttp3_conn_del(conn);
+        nghttp3_conn_del(http);
     }
 }
 
@@ -112,7 +115,7 @@ void session_del(nghttp3_conn *conn)
 /*                          Callback Functions                               */
 /* ========================================================================= */
 
-static int acked_stream_data(nghttp3_conn *c, int64_t stream_id, uint64_t datalen, void *conn_user_data,
+static int acked_stream_data(nghttp3_conn *http, int64_t stream_id, uint64_t datalen, void *conn_user_data,
                              void *stream_user_data)
 {
     connection *conn = reinterpret_cast<connection *>(conn_user_data);
@@ -127,7 +130,7 @@ static int acked_stream_data(nghttp3_conn *c, int64_t stream_id, uint64_t datale
     return 0;
 }
 
-int begin_headers(nghttp3_conn *c, int64_t stream_id, void *conn_user_data, void *stream_user_data)
+int begin_headers(nghttp3_conn *http, int64_t stream_id, void *conn_user_data, void *stream_user_data)
 {
     connection *conn = reinterpret_cast<connection *>(conn_user_data);
 
@@ -137,11 +140,11 @@ int begin_headers(nghttp3_conn *c, int64_t stream_id, void *conn_user_data, void
         NGHTTP3_ERR_CALLBACK_FAILURE;
     }
 
-    nghttp3_conn_set_stream_user_data(c, stream_id, stream);
+    nghttp3_conn_set_stream_user_data(http, stream_id, stream);
     return 0;
 }
 
-static int recv_header(nghttp3_conn *c, int64_t stream_id, int32_t token, nghttp3_rcbuf *name, nghttp3_rcbuf *value,
+static int recv_header(nghttp3_conn *http, int64_t stream_id, int32_t token, nghttp3_rcbuf *name, nghttp3_rcbuf *value,
                        uint8_t flags, void *conn_user_data, void *stream_user_data)
 {
     stream_t *stream = reinterpret_cast<stream_t *>(stream_user_data);
@@ -168,26 +171,26 @@ static int recv_header(nghttp3_conn *c, int64_t stream_id, int32_t token, nghttp
     return 0;
 }
 
-int end_headers(nghttp3_conn *conn, int64_t stream_id, int fin, void *user_data, void *stream_user_data)
+int end_headers(nghttp3_conn *http, int64_t stream_id, int fin, void *user_data, void *stream_user_data)
 {
     stream_t *stream = reinterpret_cast<stream_t *>(stream_user_data);
 
     return 0;
 }
 
-static int stop_sending(nghttp3_conn *c, int64_t stream_id, uint64_t app_error_code, void *conn_user_data,
+static int stop_sending(nghttp3_conn *http, int64_t stream_id, uint64_t app_error_code, void *conn_user_data,
                         void *stream_user_data)
 {
     return 0;
 }
 
-static int reset_stream(nghttp3_conn *c, int64_t stream_id, uint64_t app_error_code, void *conn_user_data,
+static int reset_stream(nghttp3_conn *http, int64_t stream_id, uint64_t app_error_code, void *conn_user_data,
                         void *stream_user_data)
 {
     return 0;
 }
 
-static int stream_close(nghttp3_conn *c, int64_t stream_id, uint64_t app_error_code, void *conn_user_data,
+static int stream_close(nghttp3_conn *http, int64_t stream_id, uint64_t app_error_code, void *conn_user_data,
                         void *stream_user_data)
 {
     stream_t *stream = reinterpret_cast<stream_t *>(stream_user_data);
@@ -202,7 +205,7 @@ static int stream_close(nghttp3_conn *c, int64_t stream_id, uint64_t app_error_c
     return 0;
 }
 
-int shutdown(nghttp3_conn *c, int64_t id, void *conn_user_data)
+int shutdown(nghttp3_conn *http, int64_t id, void *conn_user_data)
 {
     connection *conn = reinterpret_cast<connection *>(conn_user_data);
 

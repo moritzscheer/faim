@@ -2,7 +2,6 @@
 
 #pragma once
 
-#include "../../utils/map.hpp"
 #include "../stream.hpp"
 
 namespace faim
@@ -10,28 +9,26 @@ namespace faim
 namespace networking
 {
 
-#define WEBTRANSPORT_PROTOCOL_VIOLATION -200
-
-struct ngwebtr_conn
+struct ngwebt_conn
 {
     uint64_t id;
 
-    stream_t *control_stream;
+    int session_new();
 
-    std::vector<stream_t *> streams;
-
-    ngwebtr_conn *next;
+    void session_del();
 };
 
-int session_new(void *conn);
+namespace webt
+{
 
-void session_del(connection *conn, ngwebtr_conn *webt);
+#define WEBTRANSPORT_PROTOCOL_VIOLATION -200
 
 uint64_t infer_quic_error_code(int err);
 
-int ngwebtr_conn_close_stream(connection *conn, stream_t *stream);
+int ngwebtr_conn_close_stream();
 
-bool stream_is_control_stream(ngwebtr_conn *conn, stream_t *stream);
+bool stream_is_control_stream();
 
+}; // namespace webt
 }; // namespace networking
 }; // namespace faim

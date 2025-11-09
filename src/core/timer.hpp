@@ -3,25 +3,14 @@
 #pragma once
 
 #include <cstdint>
-#include <functional>
+#include <liburing.h>
+#include <linux/time_types.h>
 #include <sys/socket.h>
 
 namespace faim
 {
 namespace networking
 {
-
-#define QUIC_TIMEOUT 1
-#define WEBTRANSPORT_TIMEOUT 2
-
-#define LEVEL_0_BUCKETS 256
-#define LEVEL_1_BUCKETS 128
-#define LEVEL_2_BUCKETS 64
-#define LEVEL_3_BUCKETS 32
-
-#define NUM_LEVELS 4
-
-#define BASE_MEMORY_SIZE sizeof(bucket_t) * (LEVEL_0_BUCKETS + LEVEL_1_BUCKETS + LEVEL_2_BUCKETS + LEVEL_3_BUCKETS)
 
 struct timer_t
 {
@@ -30,6 +19,29 @@ struct timer_t
     bool cancelled = false;
     timer_t *next;
 };
+
+namespace timer
+{
+
+/* -------------------------------------------- MACRO DECLARATIONS -------------------------------------------------- */
+
+#define QUIC_TIMEOUT 1
+
+#define WEBTRANSPORT_TIMEOUT 2
+
+#define LEVEL_0_BUCKETS 256
+
+#define LEVEL_1_BUCKETS 128
+
+#define LEVEL_2_BUCKETS 64
+
+#define LEVEL_3_BUCKETS 32
+
+#define NUM_LEVELS 4
+
+#define BASE_MEMORY_SIZE sizeof(bucket_t) * (LEVEL_0_BUCKETS + LEVEL_1_BUCKETS + LEVEL_2_BUCKETS + LEVEL_3_BUCKETS)
+
+/* ------------------------------------------- STRUCT DECLARATIONS -------------------------------------------------- */
 
 struct bucket_t
 {
@@ -44,32 +56,67 @@ struct level_t
     uint32_t cursor = 0;
 };
 
-class timerwheel
-{
-  public:
-    timerwheel();
+/* ------------------------------------------ VARIABLES DECLARATIONS ------------------------------------------------ */
 
-    int setup(int &error) noexcept;
+//
+//
+//
+static level_t levels[NUM_LEVELS];
 
-    void cleanup() noexcept;
+//
+//
+//
+static uint64_t current_tick;
 
-    static timer_t *add_timer(uint64_t timeout, void *conn) noexcept;
+//
+//
+//
+static bucket_t *base;
 
-    static int handle_timeouts() noexcept;
+//
+//
+//
+static uint64_t num_timers;
 
-  private:
-    static void insert_timer(timer_t *timer, uint8_t level_index) noexcept;
+/* ------------------------------------------- FUNCTION DECLARATIONS ------------------------------------------------ */
 
-    static std::function<int(msghdr *)> write_pkt;
+//
+//
+//
+int setup(io_uring *ring_r) noexcept;
 
-    static level_t levels[NUM_LEVELS];
+//
+//
+//
+void cleanup() noexcept;
 
-    static uint64_t current_tick;
+//
+//
+//
+timer_t *add(uint64_t timeout, void *conn) noexcept;
 
-    static bucket_t *base;
+//
+//
+//
+void cancel(timer_t *timer);
 
-    static uint64_t num_timers;
-};
+//
+//
+//
+int validate(io_uring_cqe *cqe) noexcept;
 
+//
+//
+//
+static void insert_timer(timer_t *timer, uint8_t level_index) noexcept;
+
+//
+//
+//
+static __kernel_timespec timespec = {0, 1000000};
+
+/* ------------------------------------------------------------------------------------------------------------------ */
+
+}; // namespace timer
 }; // namespace networking
 }; // namespace faim

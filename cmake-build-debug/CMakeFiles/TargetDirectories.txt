@@ -1,3 +1,0 @@
-/home/moritz/projects/networking_http3/cmake-build-debug/CMakeFiles/networking_http3.dir
-/home/moritz/projects/networking_http3/cmake-build-debug/CMakeFiles/edit_cache.dir
-/home/moritz/projects/networking_http3/cmake-build-debug/CMakeFiles/rebuild_cache.dir
